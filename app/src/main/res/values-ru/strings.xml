@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">Блокировка медиа-кнопки</string>
+
+    <string name="toggle_title">Блокировать медиакнопку</string>
+    <string name="toggle_subtitle">Подавлять нажатия кнопки на наушниках</string>
+
+    <string name="status_enabled">Блокировка включена. Кнопка на наушниках не сработает.</string>
+    <string name="status_disabled">Блокировка выключена. Другие приложения получат нажатие.</string>
+
+    <string name="help_title">Как это работает</string>
+    <string name="help_body">Когда блокировка включена, приложение запускает фоновый сервис, который перехватывает нажатие кнопки play/pause на проводных и Bluetooth-наушниках и не передаёт его дальше. Поэтому мессенджеры, которые используют эту кнопку для включения/выключения микрофона, не отреагируют.\n\nAndroid требует постоянное уведомление, пока сервис работает. Нажми на него, чтобы открыть приложение, или используй кнопку «Стоп», чтобы отключить блокировку.</string>
+
+    <string name="notification_channel_name">Блокировка медиакнопки</string>
+    <string name="notification_channel_desc">Фоновый сервис, перехватывающий нажатие кнопки на наушниках</string>
+    <string name="notification_title">Медиакнопка заблокирована</string>
+    <string name="notification_text">Нажатие play/pause на наушниках перехватывается.</string>
+    <string name="notification_stop_action">Стоп</string>
+</resources>
