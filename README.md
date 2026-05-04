@@ -1,5 +1,7 @@
 # Media Button Blocker
 
+🌐 **Русский** · [English](README.en.md)
+
 Маленькое Android-приложение, которое перехватывает нажатия медиа-кнопки
 (play / pause / headset hook) на проводных и Bluetooth-наушниках, чтобы
 другие приложения (например, **TeamTalk**, который использует эту кнопку
