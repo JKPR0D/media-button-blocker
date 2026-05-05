@@ -9,10 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
-import android.media.AudioDeviceCallback
-import android.media.AudioDeviceInfo
 import android.media.AudioManager
-import android.media.AudioPlaybackConfiguration
 import android.media.MediaPlayer
 import android.os.Build
 import android.os.Handler
@@ -20,14 +17,9 @@ import android.os.IBinder
 import android.os.Looper
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
-import android.telephony.PhoneStateListener
-import android.telephony.TelephonyCallback
-import android.telephony.TelephonyManager
 import android.util.Log
-import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.media.session.MediaButtonReceiver
-import java.util.concurrent.Executor
 
 /**
  * Foreground service that intercepts headphone media-button events.
@@ -40,40 +32,21 @@ import java.util.concurrent.Executor
  *   2. Our [MediaSessionCompat.Callback.onMediaButtonEvent] returns `true` to consume
  *      the event without forwarding it. Discord / Telegram / etc. therefore never see
  *      the play/pause keypress, so they don't toggle the microphone.
- *
- * Reclaiming priority after another app:
- *   When another app (a phone call, a voice-message player, a music app) takes over
- *   audio, it usually creates its own MediaSession or grabs audio focus and ends up
- *   newer than us in the system's recently-active list. After it stops, we listen
- *   for several signals and immediately re-activate our session so the headphone key
- *   comes back to us:
- *     - [AudioManager.AudioPlaybackCallback] (API 26+) for any change in active audio
- *       playback configurations (covers voice messages, music, etc.).
- *     - [AudioDeviceCallback] for device-route changes (Bluetooth disconnect/reconnect
- *       around a call, wired headset re-plug).
- *     - [TelephonyCallback] / [PhoneStateListener] for call-end (`CALL_STATE_IDLE`).
- *     - A short periodic refresh as a safety net.
  */
 class BlockerService : Service() {
 
     private lateinit var mediaSession: MediaSessionCompat
     private var silencePlayer: MediaPlayer? = null
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val mainExecutor: Executor = Executor { command -> mainHandler.post(command) }
-
+    private val refreshHandler = Handler(Looper.getMainLooper())
     private val refreshRunnable: Runnable = object : Runnable {
         override fun run() {
-            // Periodic safety-net reassertion in case the event-driven listeners miss
-            // a signal (e.g. a session change inside a process we can't observe).
-            reassertSession(reason = "periodic")
-            mainHandler.postDelayed(this, REFRESH_INTERVAL_MS)
+            // Periodically re-affirm our session as the most-recently-active one so
+            // other apps (e.g. TeamTalk re-creating its own session mid-call) cannot
+            // steal media-button routing back from us.
+            refreshSessionState()
+            refreshHandler.postDelayed(this, REFRESH_INTERVAL_MS)
         }
     }
-
-    private var audioPlaybackCallback: AudioManager.AudioPlaybackCallback? = null
-    private var audioDeviceCallback: AudioDeviceCallback? = null
-    private var telephonyCallback: TelephonyCallback? = null
-    private var phoneStateListener: PhoneStateListener? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -84,9 +57,7 @@ class BlockerService : Service() {
         startInForeground()
         initMediaSession()
         startSilentLoop()
-        registerAudioCallbacks()
-        registerTelephonyCallback()
-        mainHandler.postDelayed(refreshRunnable, REFRESH_INTERVAL_MS)
+        refreshHandler.postDelayed(refreshRunnable, REFRESH_INTERVAL_MS)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -103,9 +74,7 @@ class BlockerService : Service() {
 
     override fun onDestroy() {
         Log.d(TAG, "onDestroy")
-        mainHandler.removeCallbacks(refreshRunnable)
-        unregisterAudioCallbacks()
-        unregisterTelephonyCallback()
+        refreshHandler.removeCallbacks(refreshRunnable)
         runCatching {
             silencePlayer?.stop()
             silencePlayer?.release()
@@ -118,18 +87,7 @@ class BlockerService : Service() {
         super.onDestroy()
     }
 
-    /**
-     * Re-applies our [MediaSessionCompat] state to push us back to the front of
-     * the system's recently-active queue.
-     *
-     * Each call to [MediaSessionCompat.setPlaybackState] updates the session's
-     * "last activity" timestamp, which is what `MediaSessionManager` uses to rank
-     * routing priority. We deliberately do NOT toggle [MediaSessionCompat.isActive]
-     * here — an explicit deactivation can race with the system's session-registration
-     * pipeline (especially when triggered by listeners that fire synchronously during
-     * `onCreate`) and cause the session to drop off the routing list entirely.
-     */
-    private fun reassertSession(reason: String) {
+    private fun refreshSessionState() {
         if (!::mediaSession.isInitialized) return
         runCatching {
             if (!mediaSession.isActive) mediaSession.isActive = true
@@ -150,110 +108,7 @@ class BlockerService : Service() {
                     .build(),
             )
             silencePlayer?.takeIf { !it.isPlaying }?.start()
-            Log.d(TAG, "Re-asserted session ($reason)")
         }
-    }
-
-    private fun registerAudioCallbacks() {
-        val audioManager = getSystemService(AudioManager::class.java) ?: return
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val cb = object : AudioManager.AudioPlaybackCallback() {
-                override fun onPlaybackConfigChanged(configs: List<AudioPlaybackConfiguration>) {
-                    // Some other app started or stopped playing audio (voice message,
-                    // music, notification sound). Reassert immediately and again
-                    // shortly after, because the other session may take a beat to
-                    // release its priority.
-                    reassertSession(reason = "playback-config-changed")
-                    mainHandler.postDelayed(
-                        { reassertSession(reason = "playback-config-changed-followup") },
-                        300L,
-                    )
-                }
-            }
-            audioManager.registerAudioPlaybackCallback(cb, mainHandler)
-            audioPlaybackCallback = cb
-        }
-
-        // AudioDeviceCallback exists from API 23, our minSdk is 24 so unconditional.
-        val deviceCb = object : AudioDeviceCallback() {
-            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
-                reassertSession(reason = "audio-devices-added")
-            }
-
-            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
-                reassertSession(reason = "audio-devices-removed")
-            }
-        }
-        audioManager.registerAudioDeviceCallback(deviceCb, mainHandler)
-        audioDeviceCallback = deviceCb
-    }
-
-    private fun unregisterAudioCallbacks() {
-        val audioManager = getSystemService(AudioManager::class.java) ?: return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            audioPlaybackCallback?.let(audioManager::unregisterAudioPlaybackCallback)
-        }
-        audioDeviceCallback?.let(audioManager::unregisterAudioDeviceCallback)
-        audioPlaybackCallback = null
-        audioDeviceCallback = null
-    }
-
-    private fun registerTelephonyCallback() {
-        val tm = getSystemService(TelephonyManager::class.java) ?: return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            registerModernTelephonyCallback(tm)
-        } else {
-            registerLegacyPhoneStateListener(tm)
-        }
-    }
-
-    @RequiresApi(Build.VERSION_CODES.S)
-    private fun registerModernTelephonyCallback(tm: TelephonyManager) {
-        val cb = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
-            override fun onCallStateChanged(state: Int) {
-                if (state == TelephonyManager.CALL_STATE_IDLE) {
-                    // Call ended — give the system a moment to wind down call audio,
-                    // then reclaim media-button routing.
-                    mainHandler.postDelayed(
-                        { reassertSession(reason = "call-ended") },
-                        500L,
-                    )
-                }
-            }
-        }
-        runCatching { tm.registerTelephonyCallback(mainExecutor, cb) }
-        telephonyCallback = cb
-    }
-
-    @Suppress("DEPRECATION")
-    private fun registerLegacyPhoneStateListener(tm: TelephonyManager) {
-        val listener = object : PhoneStateListener() {
-            override fun onCallStateChanged(state: Int, phoneNumber: String?) {
-                if (state == TelephonyManager.CALL_STATE_IDLE) {
-                    mainHandler.postDelayed(
-                        { reassertSession(reason = "call-ended") },
-                        500L,
-                    )
-                }
-            }
-        }
-        runCatching { tm.listen(listener, PhoneStateListener.LISTEN_CALL_STATE) }
-        phoneStateListener = listener
-    }
-
-    private fun unregisterTelephonyCallback() {
-        val tm = getSystemService(TelephonyManager::class.java) ?: return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            telephonyCallback?.let { runCatching { tm.unregisterTelephonyCallback(it) } }
-        } else {
-            @Suppress("DEPRECATION")
-            phoneStateListener?.let {
-                runCatching { tm.listen(it, PhoneStateListener.LISTEN_NONE) }
-            }
-        }
-        telephonyCallback = null
-        phoneStateListener = null
     }
 
     // --- setup helpers -----------------------------------------------------------------
@@ -380,11 +235,7 @@ class BlockerService : Service() {
         private const val TAG = "BlockerService"
         private const val CHANNEL_ID = "blocker_channel"
         private const val NOTIFICATION_ID = 1001
-        // Periodic safety-net reassertion. The event-driven listeners
-        // (audio playback / device / telephony) are the primary mechanism, so this
-        // is just a backstop — kept short enough to recover from a missed signal
-        // within ~1 second of the user noticing.
-        private const val REFRESH_INTERVAL_MS = 1_000L
+        private const val REFRESH_INTERVAL_MS = 3_000L
         const val ACTION_STOP = "com.julia.mediabuttonblocker.action.STOP"
 
         fun start(context: Context) {
@@ -402,8 +253,10 @@ class BlockerService : Service() {
 
         @Suppress("UNUSED_PARAMETER")
         fun isAudioRouteHeadset(context: Context): Boolean {
-            // Reserved for future heuristics. The blocker is unconditional today.
-            return true
+            // Reserved for future use: detect if BT/wired headset is plugged in.
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return false
+            @Suppress("DEPRECATION")
+            return am.isWiredHeadsetOn || am.isBluetoothA2dpOn || am.isBluetoothScoOn
         }
     }
 }
