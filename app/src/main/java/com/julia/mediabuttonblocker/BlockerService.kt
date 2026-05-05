@@ -169,6 +169,12 @@ class BlockerService : Service() {
      *      this is the documented way to push our session back to the top of
      *      MediaSessionManager's most-recently-active list.
      *   3. Push a fresh PlaybackStateCompat with a current timestamp.
+     *
+     * v1.10: this no longer rebuilds the notification on every call. The 1Hz periodic
+     * refresh would otherwise fire `notify()` once per second, which TalkBack picks
+     * up as a fresh announcement and reads aloud. The notification is now only
+     * rebuilt when something semantically interesting happens (a media button is
+     * blocked, the audio mode changes), driven from those callsites directly.
      */
     private fun refreshSessionState() {
         if (!::mediaSession.isInitialized) return
@@ -199,7 +205,6 @@ class BlockerService : Service() {
                     .build(),
             )
         }
-        updateNotificationContent()
     }
 
     /**
@@ -265,7 +270,6 @@ class BlockerService : Service() {
         }
         am.addOnModeChangedListener(executor, listener)
         modeChangedListener = listener
-        updateNotificationContent()
     }
 
     @Suppress("DEPRECATION")
@@ -294,7 +298,8 @@ class BlockerService : Service() {
         if (!sawFirstAudioModeCallback) {
             sawFirstAudioModeCallback = true
             Log.d(TAG, "AudioManager initial mode=$mode, ignoring (registration flash)")
-            updateNotificationContent()
+            // Don't push a notification update here — it would just rebroadcast the
+            // same content TalkBack already announced when the service started.
             return
         }
         modeChangeCount++
@@ -302,10 +307,10 @@ class BlockerService : Service() {
         if (mode == AudioManager.MODE_NORMAL && previous != AudioManager.MODE_NORMAL) {
             Log.d(TAG, "Audio mode returned to NORMAL, reasserting session")
             refreshSessionState()
-        } else {
-            // Surface the increment immediately even if we don't reassert this round.
-            updateNotificationContent()
         }
+        // Mode changes are real, infrequent events — it's fine for TalkBack to read
+        // the updated counter once per change.
+        updateNotificationContent()
     }
 
     /**
@@ -409,21 +414,24 @@ class BlockerService : Service() {
     }
 
     /**
-     * Compact one-line diagnostic shown in the FGS notification text. Format:
-     *   m=<audioMode> M=<modeChanges> R=<reasserts> B=<buttons> a=<secondsAgo>
-     * where audioMode is the most recently observed AudioManager.MODE_* value,
-     * modeChanges is how many times we've seen it transition, reasserts is how many
-     * times we've forced session priority back, buttons is how many media-button
-     * events our callback actually saw (i.e. successful blocks), and secondsAgo is
-     * how long ago the last reassert happened.
+     * Diagnostic line shown in the FGS notification text.
+     *
+     * v1.10 changes:
+     *   - Russian labels so a screen reader's announcement is meaningful.
+     *   - No "a=Ns" field. The per-second-changing seconds-ago value caused
+     *     TalkBack to re-announce the notification every periodic refresh, which
+     *     made the app unusable for the original blind user during testing.
+     *   - Updated only when a real semantic event happens (button blocked or
+     *     audio mode changed), not on every periodic 1Hz reassert.
      */
     private fun buildDiagnosticLine(): String {
-        val secondsAgo = if (lastReassertWallClock == 0L) {
-            "-"
-        } else {
-            ((System.currentTimeMillis() - lastReassertWallClock) / 1000L).toString()
-        }
-        return "m=$lastSeenModeForUi M=$modeChangeCount R=$reassertCount B=$buttonCount a=${secondsAgo}s"
+        return getString(
+            R.string.notification_diag,
+            lastSeenModeForUi,
+            modeChangeCount,
+            reassertCount,
+            buttonCount,
+        )
     }
 
     private fun updateNotificationContent() {
