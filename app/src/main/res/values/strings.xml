@@ -25,5 +25,5 @@
     <string name="notification_title">Media button is blocked</string>
     <string name="notification_text">Headphone play/pause is being intercepted.</string>
     <string name="notification_stop_action">Stop</string>
-    <string name="notification_diag">mode=%1$d events=%2$d pings=%3$d blocks=%4$d</string>
+    <string name="notification_diag">mode=%1$d events=%2$d pings=%3$d swaps=%4$d blocks=%5$d</string>
 </resources>

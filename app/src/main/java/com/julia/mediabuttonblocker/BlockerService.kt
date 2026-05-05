@@ -43,29 +43,49 @@ class BlockerService : Service() {
     private lateinit var mediaSession: MediaSessionCompat
     private var silencePlayer: MediaPlayer? = null
     private val refreshHandler = Handler(Looper.getMainLooper())
+    private var refreshTickCount: Int = 0
     private val refreshRunnable: Runnable = object : Runnable {
         override fun run() {
+            refreshTickCount++
             // Periodically re-affirm our session as the most-recently-active one so
             // other apps (e.g. TeamTalk re-creating its own session mid-call) cannot
             // steal media-button routing back from us.
-            refreshSessionState()
+            //
+            // Two operations interleave on the 1Hz tick:
+            //   - SESSION_SWAP_EVERY_N_TICKS: build a brand-new MediaSession, swap our
+            //     reference to it, and release the old one. This is the automatic
+            //     equivalent of the user toggling the master switch off-and-on, which
+            //     is the only operation that reliably restores media-button routing
+            //     on Android 15 once another audio stack has demoted our session.
+            //     Calling isActive=false/true on the same session is NOT sufficient.
+            //   - Otherwise: the cheap reassert (set state PLAYING with current
+            //     timestamp, ensure silent player is alive) which keeps our session at
+            //     the top of the recency-ordered routing list during normal operation.
+            if (refreshTickCount >= SESSION_SWAP_EVERY_N_TICKS) {
+                refreshTickCount = 0
+                swapMediaSession()
+            } else {
+                refreshSessionState()
+            }
             refreshHandler.postDelayed(this, REFRESH_INTERVAL_MS)
         }
     }
 
-    // --- Diagnostic counters (v1.9) -------------------------------------------------
+    // --- Diagnostic counters (v1.9, expanded in v1.11) ------------------------------
     //
     // These are shown live in the foreground-service notification text so the user
     // can read them off the screen during testing and the developer can tell:
-    //   M = mode changes seen by AudioManager.OnModeChangedListener
-    //   R = strong-reassert calls (forced isActive false→true + state bump)
-    //   B = media-button events actually delivered to our session callback
-    //   m = last seen audio mode (numeric AudioManager.MODE_*)
+    //   m = last seen audio mode (numeric AudioManager.MODE_*)
+    //   modeChangeCount = mode-listener firings
+    //   reassertCount   = cheap reassert calls (state bump + silent-player check)
+    //   sessionSwapCount = number of MediaSession recreate-and-replace cycles
+    //   buttonCount     = media-button events actually delivered to our callback
     //
-    // Without these, regressions were impossible to debug remotely — we couldn't tell
-    // whether the listener even fired or if the reassert was just too weak.
+    // The notification only refreshes on real semantic events (button block, mode
+    // change, session swap) so TalkBack doesn't re-announce on every 1Hz tick.
     private var modeChangeCount: Int = 0
     private var reassertCount: Int = 0
+    private var sessionSwapCount: Int = 0
     private var buttonCount: Int = 0
     private var lastSeenModeForUi: Int = AudioManager.MODE_NORMAL
     private var lastReassertWallClock: Long = 0L
@@ -416,13 +436,10 @@ class BlockerService : Service() {
     /**
      * Diagnostic line shown in the FGS notification text.
      *
-     * v1.10 changes:
-     *   - Russian labels so a screen reader's announcement is meaningful.
-     *   - No "a=Ns" field. The per-second-changing seconds-ago value caused
-     *     TalkBack to re-announce the notification every periodic refresh, which
-     *     made the app unusable for the original blind user during testing.
-     *   - Updated only when a real semantic event happens (button blocked or
-     *     audio mode changed), not on every periodic 1Hz reassert.
+     * v1.11: added "свап" (session-swap) counter so the user / dev can confirm the
+     * automatic session recreation cycle is firing. Updated only on real semantic
+     * events (button block, mode change, session swap) so TalkBack doesn't repeat
+     * itself on every 1Hz tick.
      */
     private fun buildDiagnosticLine(): String {
         return getString(
@@ -430,6 +447,7 @@ class BlockerService : Service() {
             lastSeenModeForUi,
             modeChangeCount,
             reassertCount,
+            sessionSwapCount,
             buttonCount,
         )
     }
@@ -442,27 +460,65 @@ class BlockerService : Service() {
     }
 
     private fun initMediaSession() {
-        mediaSession = MediaSessionCompat(this, TAG).apply {
-            setFlags(
-                MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
-                    MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS,
+        mediaSession = createNewMediaSession()
+    }
+
+    /**
+     * Builds a brand-new active [MediaSessionCompat] wired up with our blocking
+     * callback, the supported-actions mask, and a STATE_PLAYING playback state.
+     * Used both for the initial session in [onCreate] and for [swapMediaSession].
+     */
+    @Suppress("DEPRECATION")
+    private fun createNewMediaSession(): MediaSessionCompat = MediaSessionCompat(this, TAG).apply {
+        setFlags(
+            MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
+                MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS,
+        )
+        setCallback(BlockingCallback())
+
+        val supportedActions = PlaybackStateCompat.ACTION_PLAY or
+            PlaybackStateCompat.ACTION_PAUSE or
+            PlaybackStateCompat.ACTION_PLAY_PAUSE or
+            PlaybackStateCompat.ACTION_STOP or
+            PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
+            PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
+
+        val state = PlaybackStateCompat.Builder()
+            .setState(
+                PlaybackStateCompat.STATE_PLAYING,
+                System.currentTimeMillis(),
+                1.0f,
             )
-            setCallback(BlockingCallback())
+            .setActions(supportedActions)
+            .build()
+        setPlaybackState(state)
+        isActive = true
+    }
 
-            val supportedActions = PlaybackStateCompat.ACTION_PLAY or
-                PlaybackStateCompat.ACTION_PAUSE or
-                PlaybackStateCompat.ACTION_PLAY_PAUSE or
-                PlaybackStateCompat.ACTION_STOP or
-                PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
-                PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
-
-            val state = PlaybackStateCompat.Builder()
-                .setState(PlaybackStateCompat.STATE_PLAYING, 0L, 1.0f)
-                .setActions(supportedActions)
-                .build()
-            setPlaybackState(state)
-            isActive = true
+    /**
+     * Builds a fresh [MediaSessionCompat], swaps our internal reference to it, and
+     * releases the previous one. This is the programmatic equivalent of the user
+     * toggling the master switch off-and-on — the only operation reported to
+     * reliably restore media-button routing on Android 15 once another audio stack
+     * (call, voice message) has demoted our session.
+     *
+     * The new session is created and marked active *before* the old one is released,
+     * so MediaSessionManager always has at least one active session of ours; there
+     * is no observable gap during which a button press could fall through to the
+     * default routing target (which would let TeamTalk see it).
+     */
+    private fun swapMediaSession() {
+        val newSession = createNewMediaSession()
+        val oldSession = if (::mediaSession.isInitialized) mediaSession else null
+        mediaSession = newSession
+        ensureSilencePlayerRunning()
+        runCatching {
+            oldSession?.isActive = false
+            oldSession?.release()
         }
+        sessionSwapCount++
+        Log.d(TAG, "Session swapped (#$sessionSwapCount)")
+        updateNotificationContent()
     }
 
     private fun startSilentLoop() {
@@ -510,6 +566,17 @@ class BlockerService : Service() {
         private const val CHANNEL_ID = "blocker_channel"
         private const val NOTIFICATION_ID = 1001
         private const val REFRESH_INTERVAL_MS = 1_000L
+
+        /**
+         * Number of [REFRESH_INTERVAL_MS] ticks between full MediaSession swaps. With
+         * REFRESH_INTERVAL_MS = 1000 and SESSION_SWAP_EVERY_N_TICKS = 3, that's a
+         * brand-new MediaSession every 3 seconds and a cheap reassert on the other
+         * two ticks. 3s is the working compromise:
+         *   - Short enough that recovery from a missed call / voice message happens
+         *     within ~3s of the event ending, without the user touching anything.
+         *   - Long enough that we don't churn ~60 MediaSession objects per minute.
+         */
+        private const val SESSION_SWAP_EVERY_N_TICKS = 3
         const val ACTION_STOP = "com.julia.mediabuttonblocker.action.STOP"
 
         fun start(context: Context) {
