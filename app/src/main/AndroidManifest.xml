@@ -16,6 +16,7 @@
          from Doze / app-standby restrictions, so the foreground service keeps
          media-button routing priority on a low battery / in power-save mode. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:allowBackup="true"
@@ -42,6 +43,14 @@
             android:name=".BlockerService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
+
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
         <!-- MediaButtonReceiver is required so the framework can deliver media-button
              intents back to our session even when the app is not in the foreground. -->

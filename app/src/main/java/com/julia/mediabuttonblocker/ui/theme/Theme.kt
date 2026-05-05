@@ -55,9 +55,10 @@ fun MediaButtonBlockerTheme(
     val view = LocalView.current
     if (!view.isInEditMode) {
         SideEffect {
-            val window = (view.context as Activity).window
-            window.statusBarColor = colorScheme.primary.toArgb()
-            WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !darkTheme
+            val activity = view.context as? Activity ?: return@SideEffect
+            @Suppress("DEPRECATION")
+            activity.window.statusBarColor = colorScheme.primary.toArgb()
+            WindowCompat.getInsetsController(activity.window, view).isAppearanceLightStatusBars = !darkTheme
         }
     }
     MaterialTheme(colorScheme = colorScheme, content = content)
