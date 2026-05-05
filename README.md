@@ -1,81 +1,79 @@
 # Media Button Blocker
 
-🌐 **Русский** · [English](README.en.md)
+🌐 [Русский](README.ru.md) · **English**
 
-Маленькое Android-приложение, которое перехватывает нажатия медиа-кнопки
-(play / pause / headset hook) на проводных и Bluetooth-наушниках, чтобы
-другие приложения (например, **TeamTalk**, который использует эту кнопку
-для включения и выключения микрофона) не реагировали на них.
+A small Android app that intercepts media-button presses (play / pause /
+headset hook) on wired and Bluetooth headphones, so that other apps (for
+example **TeamTalk**, which uses that button to mute/unmute the mic) don't
+react to them.
 
-## Как это работает
+## How it works
 
-Приложение запускает foreground-сервис, который регистрирует
-`MediaSessionCompat` с флагами `FLAG_HANDLES_MEDIA_BUTTONS` и
-`FLAG_HANDLES_TRANSPORT_CONTROLS`, держит её активной и проигрывает в цикле
-короткий **беззвучный** аудиофайл (громкость 0), чтобы Android считал нашу
-сессию «живой» и направлял ей события медиа-кнопки.
+The app starts a foreground service that registers a `MediaSessionCompat`
+with `FLAG_HANDLES_MEDIA_BUTTONS` and `FLAG_HANDLES_TRANSPORT_CONTROLS`,
+keeps it active, and plays a short **silent** audio file in a loop
+(volume 0) so Android treats our session as "live" and routes media-button
+events to it.
 
-Колбэк `onMediaButtonEvent` возвращает `true` — событие проглатывается и
-не доходит до TeamTalk / Discord / Telegram и т.д.
+The `onMediaButtonEvent` callback returns `true` — the event is swallowed
+and never reaches TeamTalk / Discord / Telegram / etc.
 
-Каждые 3 секунды состояние воспроизведения переустанавливается на
-`STATE_PLAYING`, чтобы наше приложение оставалось «самой свежей» активной
-медиа-сессией и не уступало приоритет другим мессенджерам, которые
-пересоздают свои сессии в процессе звонка.
+Every 3 seconds the playback state is re-asserted as `STATE_PLAYING` so
+our app stays the "freshest" active media session and doesn't lose
+priority to other messengers that re-create their session mid-call.
 
-## Установка
+## Installation
 
-1. На телефоне разреши установку из неизвестных источников
-   (Настройки → Безопасность → Установка из неизвестных источников).
-2. Скопируй `app-debug.apk` на телефон и открой его — система предложит
-   установить.
-3. После установки запусти приложение **«Блокировка медиа-кнопки»**.
+1. On your phone, allow installation from unknown sources
+   (Settings → Security → Install unknown apps).
+2. Copy `app-debug.apk` to the phone and open it — the system will offer
+   to install.
+3. Once installed, launch the **"Media Button Blocker"** app.
 
-## Использование
+## Usage
 
-1. Открой приложение.
-2. Включи переключатель **«Блокировать медиакнопку»**.
-3. На Android 13+ дай разрешение на показ уведомлений (требуется системой
-   для работы foreground-сервиса).
-4. В шторке появится постоянное уведомление «Медиакнопка заблокирована» —
-   это норма, так требует Android.
-5. Открой TeamTalk и продолжай общаться. Нажатие на кнопку наушников
-   больше не будет переключать микрофон.
-6. Чтобы выключить блокировку — открой приложение и переведи переключатель
-   обратно, либо нажми **«Стоп»** в уведомлении.
+1. Open the app.
+2. Flip the **"Block media button"** switch on.
+3. On Android 13+ grant the notification permission (required by the
+   system for foreground services).
+4. A persistent **"Media button blocked"** notification will appear in
+   the shade — this is required by Android, you can't hide it.
+5. Open TeamTalk and use it normally. Pressing the headset button will
+   no longer toggle the microphone.
+6. To turn blocking off — open the app and flip the switch back, or
+   tap **"Stop"** in the notification.
 
-## Совместимость
+## Compatibility
 
 - **Min SDK:** 24 (Android 7.0)
 - **Target SDK:** 34 (Android 14)
-- **Тестировалось** против `BearWare/TeamTalk5` (Android-клиент использует
-  `MediaSessionCompat` с теми же флагами, поэтому маршрутизация
-  медиа-кнопок проходит через стандартный механизм Android, который мы
-  перехватываем).
+- **Tested** against `BearWare/TeamTalk5` (its Android client uses
+  `MediaSessionCompat` with the same flags, so media-button routing
+  goes through the standard Android mechanism that we intercept).
 
-## Известные ограничения
+## Known limitations
 
-- Если другое приложение зарегистрирует свою медиа-сессию **позже** нашей,
-  оно временно перехватит управление до следующего цикла обновления (≤ 3 с).
-- Постоянное уведомление обязательно — так Android защищает пользователя
-  от скрытых foreground-сервисов.
-- Беззвучный аудио-цикл расходует чуть-чуть батареи (минимально).
+- If another app registers its media session **after** ours, it will
+  temporarily steal routing until the next refresh cycle (≤ 3 s).
+- The persistent notification cannot be hidden — Android requires it for
+  any foreground service.
+- The silent audio loop consumes a tiny bit of battery (minimal).
 
-## Сборка из исходников
+## Building from source
 
-Требуется JDK 17 и Android SDK с `platforms;android-34` и
+Requires JDK 17 and the Android SDK with `platforms;android-34` and
 `build-tools;34.0.0`.
 
 ```bash
-# Укажи путь к Android SDK
+# Point Gradle at your Android SDK
 echo "sdk.dir=/path/to/android-sdk" > local.properties
 
-# Сборка debug APK
+# Build the debug APK
 ./gradlew :app:assembleDebug
 
-# APK будет в app/build/outputs/apk/debug/app-debug.apk
+# Output: app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## Лицензия
+## License
 
-MIT — делай с кодом что хочешь.
+MIT — do whatever you want with the code.

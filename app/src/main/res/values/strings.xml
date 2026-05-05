@@ -4,11 +4,8 @@
     <string name="toggle_title">Block media button</string>
     <string name="toggle_subtitle">Suppress play/pause from headphones</string>
 
-    <string name="status_enabled">Blocking active. Headphone media key is suppressed.</string>
-    <string name="status_disabled">Blocking off. Other apps will receive media key presses.</string>
-
-    <string name="help_title">How it works</string>
-    <string name="help_body">When enabled, the app runs a foreground service that captures media button events from your wired or Bluetooth headphones and discards them, so other apps (like messengers that mute/unmute on the play/pause key) won\'t react.\n\nA persistent notification is required by Android while the service is running. Tap it to return to this screen, or use Stop to disable blocking.</string>
+    <string name="status_enabled">Blocking enabled</string>
+    <string name="status_disabled">Blocking disabled</string>
 
     <string name="notification_channel_name">Media button blocker</string>
     <string name="notification_channel_desc">Foreground service that intercepts headphone media key</string>
