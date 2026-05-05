@@ -7,6 +7,12 @@
     <string name="status_enabled">Блокировка включена</string>
     <string name="status_disabled">Блокировка выключена</string>
 
+    <string name="update_banner_title">Доступна версия %1$s</string>
+    <string name="update_button">Обновить</string>
+    <string name="update_button_downloading">Скачивается…</string>
+    <string name="update_download_title">Обновление Media Button Blocker</string>
+    <string name="update_download_subtitle">Скачивается версия %1$s</string>
+
     <string name="notification_channel_name">Блокировка медиакнопки</string>
     <string name="notification_channel_desc">Фоновый сервис, перехватывающий нажатие кнопки на наушниках</string>
     <string name="notification_title">Медиакнопка заблокирована</string>

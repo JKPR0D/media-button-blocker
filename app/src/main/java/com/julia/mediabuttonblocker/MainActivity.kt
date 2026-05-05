@@ -1,6 +1,11 @@
 package com.julia.mediabuttonblocker
 
 import android.Manifest
+import android.app.DownloadManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -18,6 +23,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Block
+import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -30,7 +37,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -96,7 +106,43 @@ private fun BlockerScreen(
     onToggle: (Boolean) -> Unit,
 ) {
     var enabled by remember { mutableStateOf(initialEnabled) }
+    var updateInfo by remember { mutableStateOf<UpdateInfo?>(null) }
+    var pendingDownloadId by remember { mutableLongStateOf(-1L) }
     val context = LocalContext.current
+
+    // Once per Activity creation, hit the GitHub releases API and surface the
+    // banner if a newer release exists. Network failures silently leave
+    // updateInfo == null so the banner stays hidden.
+    LaunchedEffect(Unit) {
+        updateInfo = UpdateChecker.fetchLatestRelease(BuildConfig.VERSION_NAME)
+    }
+
+    // Listen for DownloadManager completion so we can hand the APK to the
+    // system installer immediately. Registered as RECEIVER_EXPORTED because
+    // the broadcast originates from the system DownloadManager process on
+    // Android 13+.
+    DisposableEffect(Unit) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                val finishedId = intent.getLongExtra(
+                    DownloadManager.EXTRA_DOWNLOAD_ID,
+                    -1L,
+                )
+                if (finishedId == -1L || finishedId != pendingDownloadId) return
+                val apk = Updater.downloadedApkFile(ctx, finishedId)
+                pendingDownloadId = -1L
+                if (apk != null) Updater.installDownloadedApk(ctx, apk)
+            }
+        }
+        val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            context.registerReceiver(receiver, filter)
+        }
+        onDispose { context.unregisterReceiver(receiver) }
+    }
 
     Scaffold(
         topBar = {
@@ -116,6 +162,15 @@ private fun BlockerScreen(
                 .padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            updateInfo?.let { info ->
+                UpdateBanner(
+                    info = info,
+                    isDownloading = pendingDownloadId != -1L,
+                    onUpdateClick = {
+                        pendingDownloadId = Updater.startDownload(context, info)
+                    },
+                )
+            }
             ToggleCard(enabled = enabled, onCheckedChange = {
                 enabled = it
                 onToggle(it)
@@ -197,3 +252,52 @@ private fun StatusCard(enabled: Boolean) {
     }
 }
 
+@Composable
+private fun UpdateBanner(
+    info: UpdateInfo,
+    isDownloading: Boolean,
+    onUpdateClick: () -> Unit,
+) {
+    val context = LocalContext.current
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+        ),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.SystemUpdate,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onTertiaryContainer,
+                )
+                Spacer(Modifier.padding(horizontal = 8.dp))
+                Text(
+                    text = context.getString(R.string.update_banner_title, info.version),
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                )
+            }
+            Button(onClick = onUpdateClick, enabled = !isDownloading) {
+                Text(
+                    text = if (isDownloading) {
+                        context.getString(R.string.update_button_downloading)
+                    } else {
+                        context.getString(R.string.update_button)
+                    },
+                )
+            }
+        }
+    }
+}

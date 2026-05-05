@@ -7,6 +7,12 @@
     <string name="status_enabled">Blocking enabled</string>
     <string name="status_disabled">Blocking disabled</string>
 
+    <string name="update_banner_title">Version %1$s available</string>
+    <string name="update_button">Update</string>
+    <string name="update_button_downloading">Downloading…</string>
+    <string name="update_download_title">Media Button Blocker update</string>
+    <string name="update_download_subtitle">Downloading version %1$s</string>
+
     <string name="notification_channel_name">Media button blocker</string>
     <string name="notification_channel_desc">Foreground service that intercepts headphone media key</string>
     <string name="notification_title">Media button is blocked</string>

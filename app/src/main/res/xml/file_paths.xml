@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- App-private external dir, used by DownloadManager.setDestinationInExternalFilesDir.
+         Maps to /sdcard/Android/data/<package>/files/ on the device. -->
+    <external-files-path
+        name="updates"
+        path="Download/" />
+</paths>
