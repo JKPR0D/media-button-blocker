@@ -25,4 +25,5 @@
     <string name="notification_title">Медиакнопка заблокирована</string>
     <string name="notification_text">Нажатие play/pause на наушниках перехватывается.</string>
     <string name="notification_stop_action">Стоп</string>
+    <string name="notification_diag">режим=%1$d событий=%2$d пинг=%3$d блок=%4$d</string>
 </resources>
