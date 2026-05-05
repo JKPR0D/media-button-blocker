@@ -119,20 +119,20 @@ class BlockerService : Service() {
     }
 
     /**
-     * Forces our [MediaSessionCompat] back to the front of the system's
-     * recently-active queue.
+     * Re-applies our [MediaSessionCompat] state to push us back to the front of
+     * the system's recently-active queue.
      *
-     * Setting [MediaSessionCompat.isActive] to `false` and back to `true` is what
-     * actually bumps us — `MediaSessionService` only updates a session's priority on
-     * activation, so simply re-applying [PlaybackStateCompat.STATE_PLAYING] on a
-     * still-active session is sometimes ignored. The brief inactive window is in the
-     * microsecond range and does not affect button routing in practice.
+     * Each call to [MediaSessionCompat.setPlaybackState] updates the session's
+     * "last activity" timestamp, which is what `MediaSessionManager` uses to rank
+     * routing priority. We deliberately do NOT toggle [MediaSessionCompat.isActive]
+     * here — an explicit deactivation can race with the system's session-registration
+     * pipeline (especially when triggered by listeners that fire synchronously during
+     * `onCreate`) and cause the session to drop off the routing list entirely.
      */
     private fun reassertSession(reason: String) {
         if (!::mediaSession.isInitialized) return
         runCatching {
-            mediaSession.isActive = false
-            mediaSession.isActive = true
+            if (!mediaSession.isActive) mediaSession.isActive = true
             val supportedActions = PlaybackStateCompat.ACTION_PLAY or
                 PlaybackStateCompat.ACTION_PAUSE or
                 PlaybackStateCompat.ACTION_PLAY_PAUSE or
