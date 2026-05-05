@@ -5,12 +5,15 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
+import android.media.session.MediaController
+import android.media.session.MediaSessionManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -45,6 +48,11 @@ class BlockerService : Service() {
     private val refreshHandler = Handler(Looper.getMainLooper())
     private val refreshRunnable: Runnable = object : Runnable {
         override fun run() {
+            // v1.13: also keep the listener registration in sync with the user's
+            // current Notification access state, so granting the permission while
+            // the service is already running takes effect within one tick without
+            // needing the master switch to be cycled.
+            maybeUpdateSessionsChangedListener()
             // v1.12: every tick is a full soft-restart of our service-internal state.
             // The reporter on Android 15 confirmed that even a brand-new MediaSession
             // (v1.11) is NOT enough on its own — the only thing that reliably
@@ -75,6 +83,7 @@ class BlockerService : Service() {
     private var reassertCount: Int = 0
     private var sessionSwapCount: Int = 0
     private var buttonCount: Int = 0
+    private var sessionsChangedCount: Int = 0
     private var lastSeenModeForUi: Int = AudioManager.MODE_NORMAL
     private var lastReassertWallClock: Long = 0L
 
@@ -116,6 +125,46 @@ class BlockerService : Service() {
     private var legacyPhoneStateListener: PhoneStateListener? = null
     private var lastSeenCallState: Int = TelephonyManager.CALL_STATE_IDLE
     private var sawFirstCallStateCallback: Boolean = false
+
+    // --- Active-sessions listener (v1.13) -------------------------------------------
+    //
+    // [MediaSessionManager.OnActiveSessionsChangedListener] gives us a system signal
+    // every time another app's MediaSession is created, destroyed or has its active
+    // state changed. Concretely:
+    //   - Incoming call: the dialer/telephony stack publishes its own session, then
+    //     tears it down when the call ends.
+    //   - Voice message in Telegram / WhatsApp / etc: the messenger publishes a
+    //     short-lived session for the playback, then releases it.
+    // In both cases, on Android 15 the in-place soft-restart we already do every
+    // 1 s (v1.12) is not enough, but the user reports that the master switch off+on
+    // (which actually kills and respawns the Service) does work. The listener gives
+    // us a precise event-driven trigger to re-run our soft-restart at the moment a
+    // foreign session goes away — the moment when our own session most needs to be
+    // pushed back to the top of the routing list.
+    //
+    // This API requires the user to grant our app "Notification access" in system
+    // settings (a one-time action). Without that grant,
+    // [MediaSessionManager.addOnActiveSessionsChangedListener] throws
+    // SecurityException. We treat the permission as optional: when it's granted we
+    // wire up the listener; when it isn't, the service still runs (just without
+    // event-driven recovery, the 1 Hz fallback still applies).
+    //
+    // Two safety rules from v1.7/v1.8 are reused as-is:
+    //   1. Deferred registration (via [refreshHandler.post]) so the new MediaSession
+    //      created in [initMediaSession] has fully propagated through the system.
+    //   2. Ignore the very first callback after registration — it carries the
+    //      current state at registration time and would otherwise trigger a
+    //      reassert before initialisation has settled (v1.3-style regression).
+    //
+    // To avoid a feedback loop with our own [performSoftRestart] (which destroys
+    // and recreates a MediaSession every 1 s, each of which fires this listener),
+    // we filter the controllers list to packages OTHER than our own. We only act
+    // when the set of foreign sessions changes — our own session swaps are then
+    // invisible to the trigger.
+    private var sessionsManager: MediaSessionManager? = null
+    private var sessionsChangedListener: MediaSessionManager.OnActiveSessionsChangedListener? = null
+    private var sawFirstSessionsChangedCallback: Boolean = false
+    private var lastForeignSessionPackages: Set<String> = emptySet()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -248,11 +297,17 @@ class BlockerService : Service() {
      *   - API < 31: legacy [PhoneStateListener]. Best-effort — will silently no-op if
      *     the system requires READ_PHONE_STATE and we haven't been granted it.
      *
+     * On top of those, in v1.13 we also register a
+     * [MediaSessionManager.OnActiveSessionsChangedListener] when the user has granted
+     * Notification access. That one gives a more direct "a foreign media session
+     * appeared/disappeared" signal which covers calls and voice messages on Android
+     * 15 even when the audio-mode listener stays silent.
+     *
      * Registration is deferred by one main-thread tick so the MediaSession we just
      * created in [initMediaSession] has a chance to finish propagating through the
      * system; the synchronous registration-time callback that fires immediately after
-     * is then dropped by the [sawFirstAudioModeCallback] / [sawFirstCallStateCallback]
-     * guards.
+     * is then dropped by the [sawFirstAudioModeCallback] /
+     * [sawFirstCallStateCallback] / [sawFirstSessionsChangedCallback] guards.
      */
     private fun registerCallStateListeners() {
         refreshHandler.post {
@@ -263,6 +318,7 @@ class BlockerService : Service() {
                 runCatching { registerLegacyPhoneStateListener() }
                     .onFailure { Log.w(TAG, "Failed to register legacy phone-state listener", it) }
             }
+            maybeUpdateSessionsChangedListener()
         }
     }
 
@@ -358,6 +414,98 @@ class BlockerService : Service() {
         }
         legacyPhoneStateListener = null
         telephonyManager = null
+
+        unregisterSessionsChangedListener()
+    }
+
+    /**
+     * Brings the [MediaSessionManager.OnActiveSessionsChangedListener] registration
+     * in line with the current Notification access permission.
+     *
+     * Called both at service start (deferred) and from the periodic refresh tick so
+     * that granting the permission after the service is already up takes effect
+     * within ~1 s without needing the master switch to be cycled. Conversely, if
+     * the user revokes the permission while the service is running, we drop the
+     * listener cleanly to avoid leaks / SecurityExceptions on the next callback.
+     */
+    private fun maybeUpdateSessionsChangedListener() {
+        val granted = NotificationAccessHelper.isGranted(this)
+        val registered = sessionsChangedListener != null
+        if (granted && !registered) {
+            runCatching { registerSessionsChangedListener() }
+                .onFailure { Log.w(TAG, "Failed to register sessions-changed listener", it) }
+        } else if (!granted && registered) {
+            unregisterSessionsChangedListener()
+        }
+    }
+
+    private fun registerSessionsChangedListener() {
+        val sm = getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager ?: return
+        val component = ComponentName(this, MediaSessionsNotificationListener::class.java)
+        val listener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
+            handleActiveSessionsChanged(controllers)
+        }
+        sm.addOnActiveSessionsChangedListener(listener, component, refreshHandler)
+        sessionsManager = sm
+        sessionsChangedListener = listener
+        sawFirstSessionsChangedCallback = false
+        lastForeignSessionPackages = emptySet()
+        Log.d(TAG, "Registered OnActiveSessionsChangedListener")
+    }
+
+    private fun unregisterSessionsChangedListener() {
+        val sm = sessionsManager
+        val listener = sessionsChangedListener
+        if (sm != null && listener != null) {
+            runCatching { sm.removeOnActiveSessionsChangedListener(listener) }
+        }
+        sessionsChangedListener = null
+        sessionsManager = null
+        sawFirstSessionsChangedCallback = false
+        lastForeignSessionPackages = emptySet()
+    }
+
+    /**
+     * Reacts to a change in the set of active media sessions on the device.
+     *
+     * Our 1 Hz [performSoftRestart] swaps our own [MediaSessionCompat] every tick,
+     * which itself fires this callback. To avoid a feedback loop we filter
+     * controllers to packages OTHER than our own and only act when the set of
+     * foreign packages changes — i.e. when an external app (dialer, Telegram,
+     * WhatsApp, etc.) appears or disappears as a media participant.
+     *
+     * On any such change we kick a [performSoftRestart] in addition to our 1 Hz
+     * baseline. The hypothesis is that Android 15 hands media-button routing back
+     * promptly when a foreign session is published / withdrawn, so a same-tick
+     * soft-restart at that exact moment maximises the chance that we reclaim it.
+     */
+    private fun handleActiveSessionsChanged(controllers: List<MediaController>?) {
+        sessionsChangedCount++
+        val foreign = controllers
+            ?.mapNotNullTo(mutableSetOf()) { ctrl ->
+                val pkg = runCatching { ctrl.packageName }.getOrNull()
+                if (pkg.isNullOrEmpty() || pkg == packageName) null else pkg
+            }
+            ?: emptySet()
+        if (!sawFirstSessionsChangedCallback) {
+            sawFirstSessionsChangedCallback = true
+            lastForeignSessionPackages = foreign
+            Log.d(TAG, "Sessions-changed initial state foreign=$foreign, ignoring (registration flash)")
+            return
+        }
+        val previousForeign = lastForeignSessionPackages
+        lastForeignSessionPackages = foreign
+        if (foreign != previousForeign) {
+            Log.d(
+                TAG,
+                "Foreign media sessions changed prev=$previousForeign current=$foreign, soft-restarting",
+            )
+            performSoftRestart()
+            // Notification only updates here, not on every 1 Hz tick — keeps TalkBack
+            // quiet but still surfaces "слушатель=N" so the user / dev can verify the
+            // listener is firing.
+            updateNotificationContent()
+        }
     }
 
     // --- setup helpers -----------------------------------------------------------------
@@ -436,6 +584,7 @@ class BlockerService : Service() {
             modeChangeCount,
             reassertCount,
             sessionSwapCount,
+            sessionsChangedCount,
             buttonCount,
         )
     }
