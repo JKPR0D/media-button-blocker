@@ -17,7 +17,11 @@ import android.os.IBinder
 import android.os.Looper
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
+import android.telephony.PhoneStateListener
+import android.telephony.TelephonyCallback
+import android.telephony.TelephonyManager
 import android.util.Log
+import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.media.session.MediaButtonReceiver
 
@@ -48,6 +52,29 @@ class BlockerService : Service() {
         }
     }
 
+    // --- Telephony listening ---------------------------------------------------------
+    //
+    // We watch for phone-call state transitions so we can re-assert our MediaSession
+    // the moment a call ends. This addresses the v1.2-era regression "blocking dies
+    // after I take or end a call": while the phone is ringing or in-call, the in-call
+    // audio stack temporarily steals media-button routing, and Android does not always
+    // hand it back to us once the call returns to IDLE.
+    //
+    // Two safety rules apply, learned the hard way from v1.3 (which broke blocking
+    // entirely):
+    //   1. We register the listener AFTER initMediaSession() / startSilentLoop()
+    //      so the session is already known to MediaSessionManager.
+    //   2. We IGNORE the first callback we receive after registration. Both
+    //      TelephonyCallback and PhoneStateListener fire synchronously with the
+    //      current state at registration time; reacting to that 'flash' would run a
+    //      reassert before our session has fully propagated through the system, which
+    //      is exactly what knocked us off the routing list in v1.3.
+    private var telephonyManager: TelephonyManager? = null
+    private var modernTelephonyCallback: TelephonyCallback? = null
+    private var legacyPhoneStateListener: PhoneStateListener? = null
+    private var lastSeenCallState: Int = TelephonyManager.CALL_STATE_IDLE
+    private var sawFirstCallStateCallback: Boolean = false
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -57,6 +84,9 @@ class BlockerService : Service() {
         startInForeground()
         initMediaSession()
         startSilentLoop()
+        // Telephony listener has to come after the session is fully wired up.
+        // See registerTelephonyCallback() for why we also wait one tick.
+        registerTelephonyCallback()
         refreshHandler.postDelayed(refreshRunnable, REFRESH_INTERVAL_MS)
     }
 
@@ -75,6 +105,7 @@ class BlockerService : Service() {
     override fun onDestroy() {
         Log.d(TAG, "onDestroy")
         refreshHandler.removeCallbacks(refreshRunnable)
+        unregisterTelephonyCallback()
         runCatching {
             silencePlayer?.stop()
             silencePlayer?.release()
@@ -109,6 +140,93 @@ class BlockerService : Service() {
             )
             silencePlayer?.takeIf { !it.isPlaying }?.start()
         }
+    }
+
+    // --- telephony listener wiring ----------------------------------------------------
+
+    /**
+     * Subscribes to phone-call state changes so we can reassert our session as soon as
+     * a call ends. We deliberately defer registration by one main-thread tick so the
+     * MediaSession we just created in [initMediaSession] has a chance to finish
+     * propagating through the system; if a synchronous registration callback then
+     * fires (it always does, with the current call state), [onCallStateChanged] will
+     * skip the reassert thanks to [sawFirstCallStateCallback].
+     */
+    private fun registerTelephonyCallback() {
+        val tm = getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager ?: return
+        telephonyManager = tm
+        refreshHandler.post {
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    registerModernTelephonyCallback(tm)
+                } else {
+                    registerLegacyPhoneStateListener(tm)
+                }
+            }.onFailure { Log.w(TAG, "Failed to register telephony listener", it) }
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.S)
+    private fun registerModernTelephonyCallback(tm: TelephonyManager) {
+        val cb = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
+            override fun onCallStateChanged(state: Int) {
+                handleCallStateChanged(state)
+            }
+        }
+        tm.registerTelephonyCallback(mainExecutor, cb)
+        modernTelephonyCallback = cb
+    }
+
+    @Suppress("DEPRECATION")
+    private fun registerLegacyPhoneStateListener(tm: TelephonyManager) {
+        val listener = object : PhoneStateListener() {
+            override fun onCallStateChanged(state: Int, phoneNumber: String?) {
+                handleCallStateChanged(state)
+            }
+        }
+        tm.listen(listener, PhoneStateListener.LISTEN_CALL_STATE)
+        legacyPhoneStateListener = listener
+    }
+
+    /**
+     * Handles the actual call-state transition. We only reassert our session when the
+     * call returns to IDLE *from* a non-IDLE state (i.e. a real RINGING -> IDLE or
+     * OFFHOOK -> IDLE transition). The very first callback after registration carries
+     * the current state and is ignored — see [sawFirstCallStateCallback] / the comment
+     * on the field.
+     */
+    private fun handleCallStateChanged(state: Int) {
+        val previous = lastSeenCallState
+        lastSeenCallState = state
+        if (!sawFirstCallStateCallback) {
+            sawFirstCallStateCallback = true
+            Log.d(TAG, "Telephony initial state=$state, ignoring (registration flash)")
+            return
+        }
+        if (state == TelephonyManager.CALL_STATE_IDLE &&
+            previous != TelephonyManager.CALL_STATE_IDLE
+        ) {
+            Log.d(TAG, "Call ended (prev=$previous), reasserting session")
+            refreshSessionState()
+        }
+    }
+
+    private fun unregisterTelephonyCallback() {
+        val tm = telephonyManager ?: return
+        runCatching {
+            modernTelephonyCallback?.let {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    tm.unregisterTelephonyCallback(it)
+                }
+            }
+        }
+        @Suppress("DEPRECATION")
+        runCatching {
+            legacyPhoneStateListener?.let { tm.listen(it, PhoneStateListener.LISTEN_NONE) }
+        }
+        modernTelephonyCallback = null
+        legacyPhoneStateListener = null
+        telephonyManager = null
     }
 
     // --- setup helpers -----------------------------------------------------------------
