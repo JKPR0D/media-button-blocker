@@ -43,30 +43,18 @@ class BlockerService : Service() {
     private lateinit var mediaSession: MediaSessionCompat
     private var silencePlayer: MediaPlayer? = null
     private val refreshHandler = Handler(Looper.getMainLooper())
-    private var refreshTickCount: Int = 0
     private val refreshRunnable: Runnable = object : Runnable {
         override fun run() {
-            refreshTickCount++
-            // Periodically re-affirm our session as the most-recently-active one so
-            // other apps (e.g. TeamTalk re-creating its own session mid-call) cannot
-            // steal media-button routing back from us.
-            //
-            // Two operations interleave on the 1Hz tick:
-            //   - SESSION_SWAP_EVERY_N_TICKS: build a brand-new MediaSession, swap our
-            //     reference to it, and release the old one. This is the automatic
-            //     equivalent of the user toggling the master switch off-and-on, which
-            //     is the only operation that reliably restores media-button routing
-            //     on Android 15 once another audio stack has demoted our session.
-            //     Calling isActive=false/true on the same session is NOT sufficient.
-            //   - Otherwise: the cheap reassert (set state PLAYING with current
-            //     timestamp, ensure silent player is alive) which keeps our session at
-            //     the top of the recency-ordered routing list during normal operation.
-            if (refreshTickCount >= SESSION_SWAP_EVERY_N_TICKS) {
-                refreshTickCount = 0
-                swapMediaSession()
-            } else {
-                refreshSessionState()
-            }
+            // v1.12: every tick is a full soft-restart of our service-internal state.
+            // The reporter on Android 15 confirmed that even a brand-new MediaSession
+            // (v1.11) is NOT enough on its own — the only thing that reliably
+            // restores media-button routing after a missed call or a voice message
+            // is toggling the master switch, which destroys *and recreates* the
+            // entire BlockerService. The hypothesis is that toggling also re-runs
+            // startForeground() (refreshing the FGS as TYPE_MEDIA_PLAYBACK) and
+            // creates a fresh silent MediaPlayer. v1.12 reproduces all three in
+            // place, every second, without actually killing the Service.
+            performSoftRestart()
             refreshHandler.postDelayed(this, REFRESH_INTERVAL_MS)
         }
     }
@@ -496,29 +484,73 @@ class BlockerService : Service() {
     }
 
     /**
-     * Builds a fresh [MediaSessionCompat], swaps our internal reference to it, and
-     * releases the previous one. This is the programmatic equivalent of the user
-     * toggling the master switch off-and-on — the only operation reported to
-     * reliably restore media-button routing on Android 15 once another audio stack
-     * (call, voice message) has demoted our session.
+     * Performs a full soft-restart of our service-internal state without actually
+     * stopping and restarting the Service. This is the in-place equivalent of the
+     * user toggling the master switch off and back on — reported on Android 15 to
+     * be the only operation that reliably restores media-button routing after a
+     * missed call or a voice message.
      *
-     * The new session is created and marked active *before* the old one is released,
-     * so MediaSessionManager always has at least one active session of ours; there
-     * is no observable gap during which a button press could fall through to the
-     * default routing target (which would let TeamTalk see it).
+     * Unlike v1.11's MediaSession-only swap, this also:
+     *   - Tears down and recreates the silent [MediaPlayer]. After a call the audio
+     *     focus stack can leave the player in a state where `isPlaying` returns
+     *     `true` while audio is no longer flowing, so we don't trust the flag and
+     *     just rebuild it.
+     *   - Re-calls [startForeground] with `FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK`.
+     *     The hypothesis is that during a call Android 15 temporarily demotes our
+     *     FGS type, and only re-asserting it via `startForeground` puts us back
+     *     into the priority class that wins media-button routing.
+     *
+     * Order of operations is chosen to minimise the window during which we lack a
+     * routable session:
+     *   1. Build a new active MediaSession.
+     *   2. Swap our field reference to it (now there are two of our sessions, the
+     *      new one is most-recently-active so MediaSessionManager prefers it).
+     *   3. Tear down the old MediaSession.
+     *   4. Tear down + rebuild the silent MediaPlayer.
+     *   5. Re-call startForeground() to re-assert FGS type.
+     *
+     * Notification updates are intentionally NOT triggered here. With a 1 Hz cadence
+     * any notification rebuild would cause TalkBack to re-announce every second and
+     * make the app unusable for screen-reader users (we already learned this in
+     * v1.10). The session-swap counter still increments and will surface in the
+     * next event-driven notification update.
      */
-    private fun swapMediaSession() {
+    private fun performSoftRestart() {
         val newSession = createNewMediaSession()
         val oldSession = if (::mediaSession.isInitialized) mediaSession else null
         mediaSession = newSession
-        ensureSilencePlayerRunning()
+
         runCatching {
             oldSession?.isActive = false
             oldSession?.release()
         }
+
+        runCatching {
+            silencePlayer?.stop()
+            silencePlayer?.release()
+        }
+        silencePlayer = null
+        runCatching { startSilentLoop() }
+            .onFailure { Log.w(TAG, "Failed to restart silent loop", it) }
+
+        // Re-assert our FGS type. With the same NOTIFICATION_ID this updates the
+        // existing notification in place rather than posting a new one, so TalkBack
+        // doesn't re-announce.
+        runCatching {
+            val notification = buildNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        }.onFailure { Log.w(TAG, "Failed to re-assert foreground status", it) }
+
         sessionSwapCount++
-        Log.d(TAG, "Session swapped (#$sessionSwapCount)")
-        updateNotificationContent()
+        Log.d(TAG, "Soft restart complete (#$sessionSwapCount)")
     }
 
     private fun startSilentLoop() {
@@ -565,18 +597,10 @@ class BlockerService : Service() {
         private const val TAG = "BlockerService"
         private const val CHANNEL_ID = "blocker_channel"
         private const val NOTIFICATION_ID = 1001
+        // v1.12: every tick performs a full soft-restart, so the swap interval
+        // *is* the recovery latency after a call / voice message ends. 1s keeps it
+        // perceptually instant.
         private const val REFRESH_INTERVAL_MS = 1_000L
-
-        /**
-         * Number of [REFRESH_INTERVAL_MS] ticks between full MediaSession swaps. With
-         * REFRESH_INTERVAL_MS = 1000 and SESSION_SWAP_EVERY_N_TICKS = 3, that's a
-         * brand-new MediaSession every 3 seconds and a cheap reassert on the other
-         * two ticks. 3s is the working compromise:
-         *   - Short enough that recovery from a missed call / voice message happens
-         *     within ~3s of the event ending, without the user touching anything.
-         *   - Long enough that we don't churn ~60 MediaSession objects per minute.
-         */
-        private const val SESSION_SWAP_EVERY_N_TICKS = 3
         const val ACTION_STOP = "com.julia.mediabuttonblocker.action.STOP"
 
         fun start(context: Context) {
