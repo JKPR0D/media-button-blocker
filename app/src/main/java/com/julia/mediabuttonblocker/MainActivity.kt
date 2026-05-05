@@ -9,6 +9,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -22,6 +23,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BatteryAlert
+import androidx.compose.material.icons.filled.BatterySaver
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material3.Button
@@ -47,8 +50,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.julia.mediabuttonblocker.ui.theme.MediaButtonBlockerTheme
 
 class MainActivity : ComponentActivity() {
@@ -144,6 +150,44 @@ private fun BlockerScreen(
         onDispose { context.unregisterReceiver(receiver) }
     }
 
+    // Battery-optimisation exemption is a per-app setting, the user toggles it
+    // from a system dialog that lives outside our process. Re-check on every
+    // ON_RESUME so the banner disappears as soon as they grant the exemption.
+    var batteryOptimized by remember {
+        mutableStateOf(!BatterySaverHelper.isIgnoringBatteryOptimizations(context))
+    }
+    var powerSaveOn by remember { mutableStateOf(BatterySaverHelper.isPowerSaveMode(context)) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                batteryOptimized = !BatterySaverHelper.isIgnoringBatteryOptimizations(context)
+                powerSaveOn = BatterySaverHelper.isPowerSaveMode(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // Power-save mode flips on/off without restarting the activity (e.g. when
+    // the user plugs in or unplugs the charger), so we listen for the system
+    // broadcast and update the flag live.
+    DisposableEffect(Unit) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                powerSaveOn = BatterySaverHelper.isPowerSaveMode(ctx)
+            }
+        }
+        val filter = IntentFilter(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
+        ContextCompat.registerReceiver(
+            context,
+            receiver,
+            filter,
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        onDispose { context.unregisterReceiver(receiver) }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -171,11 +215,107 @@ private fun BlockerScreen(
                     },
                 )
             }
+            if (batteryOptimized) {
+                BatteryOptimizationBanner(
+                    onAllowClick = {
+                        BatterySaverHelper.requestIgnoreBatteryOptimizations(context)
+                    },
+                )
+            }
+            if (powerSaveOn) {
+                PowerSaveBanner()
+            }
             ToggleCard(enabled = enabled, onCheckedChange = {
                 enabled = it
                 onToggle(it)
             })
             StatusCard(enabled = enabled)
+        }
+    }
+}
+
+@Composable
+private fun BatteryOptimizationBanner(onAllowClick: () -> Unit) {
+    val context = LocalContext.current
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+        ),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f, fill = true),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.BatteryAlert,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onTertiaryContainer,
+                )
+                Spacer(Modifier.padding(horizontal = 8.dp))
+                Column {
+                    Text(
+                        text = context.getString(R.string.battery_optimization_banner_title),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    )
+                    Text(
+                        text = context.getString(R.string.battery_optimization_banner_text),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    )
+                }
+            }
+            Spacer(Modifier.padding(horizontal = 4.dp))
+            Button(onClick = onAllowClick) {
+                Text(context.getString(R.string.battery_optimization_banner_button))
+            }
+        }
+    }
+}
+
+@Composable
+private fun PowerSaveBanner() {
+    val context = LocalContext.current
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer,
+        ),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = Icons.Filled.BatterySaver,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onErrorContainer,
+            )
+            Spacer(Modifier.padding(horizontal = 8.dp))
+            Column {
+                Text(
+                    text = context.getString(R.string.power_save_banner_title),
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                )
+                Text(
+                    text = context.getString(R.string.power_save_banner_text),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                )
+            }
         }
     }
 }

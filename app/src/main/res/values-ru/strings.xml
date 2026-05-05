@@ -13,6 +13,13 @@
     <string name="update_download_title">Обновление Media Button Blocker</string>
     <string name="update_download_subtitle">Скачивается версия %1$s</string>
 
+    <string name="battery_optimization_banner_title">Разрешить работу в фоне</string>
+    <string name="battery_optimization_banner_text">Android может ограничить блокировку при низком заряде. Один раз добавьте приложение в исключения, чтобы блокировка работала стабильно.</string>
+    <string name="battery_optimization_banner_button">Разрешить</string>
+
+    <string name="power_save_banner_title">Включён режим экономии</string>
+    <string name="power_save_banner_text">В режиме экономии заряда блокировка медиа-кнопки может ненадолго перестать срабатывать. Подключите зарядку или отключите режим экономии для надёжной работы.</string>
+
     <string name="notification_channel_name">Блокировка медиакнопки</string>
     <string name="notification_channel_desc">Фоновый сервис, перехватывающий нажатие кнопки на наушниках</string>
     <string name="notification_title">Медиакнопка заблокирована</string>
