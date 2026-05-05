@@ -12,6 +12,10 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Lets us launch the system installer for the downloaded APK. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Lets us ask the user (via the standard system dialog) to exempt this app
+         from Doze / app-standby restrictions, so the foreground service keeps
+         media-button routing priority on a low battery / in power-save mode. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:allowBackup="true"

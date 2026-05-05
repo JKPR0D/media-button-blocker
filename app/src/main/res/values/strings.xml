@@ -13,6 +13,13 @@
     <string name="update_download_title">Media Button Blocker update</string>
     <string name="update_download_subtitle">Downloading version %1$s</string>
 
+    <string name="battery_optimization_banner_title">Allow background work</string>
+    <string name="battery_optimization_banner_text">Android can throttle the blocker on low battery. Whitelist the app once so blocking keeps working.</string>
+    <string name="battery_optimization_banner_button">Allow</string>
+
+    <string name="power_save_banner_title">Battery Saver is on</string>
+    <string name="power_save_banner_text">While the system is in power-save mode the blocker may briefly stop intercepting the media button. Plug in or turn off Battery Saver for reliable blocking.</string>
+
     <string name="notification_channel_name">Media button blocker</string>
     <string name="notification_channel_desc">Foreground service that intercepts headphone media key</string>
     <string name="notification_title">Media button is blocked</string>
