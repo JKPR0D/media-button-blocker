@@ -53,6 +53,23 @@ class BlockerService : Service() {
         }
     }
 
+    // --- Diagnostic counters (v1.9) -------------------------------------------------
+    //
+    // These are shown live in the foreground-service notification text so the user
+    // can read them off the screen during testing and the developer can tell:
+    //   M = mode changes seen by AudioManager.OnModeChangedListener
+    //   R = strong-reassert calls (forced isActive false→true + state bump)
+    //   B = media-button events actually delivered to our session callback
+    //   m = last seen audio mode (numeric AudioManager.MODE_*)
+    //
+    // Without these, regressions were impossible to debug remotely — we couldn't tell
+    // whether the listener even fired or if the reassert was just too weak.
+    private var modeChangeCount: Int = 0
+    private var reassertCount: Int = 0
+    private var buttonCount: Int = 0
+    private var lastSeenModeForUi: Int = AudioManager.MODE_NORMAL
+    private var lastReassertWallClock: Long = 0L
+
     // --- Audio-mode / call-state listening -------------------------------------------
     //
     // We watch for the system audio-mode going back to MODE_NORMAL from anything
@@ -135,10 +152,36 @@ class BlockerService : Service() {
         super.onDestroy()
     }
 
+    /**
+     * Re-affirms our MediaSession as the active media-button recipient.
+     *
+     * v1.9 strengthens this from a "gentle" timestamp bump (which seems to be
+     * insufficient on Android 15 once another audio stack has held priority during a
+     * call or voice message) into a stronger sequence:
+     *
+     *   1. If the silent player is dead / paused / errored (which can happen when the
+     *      audio focus is yanked during a call), tear it down and start a fresh one.
+     *      Without an audible playback our session loses its "live media app" status.
+     *   2. Toggle isActive false → true. This is what v1.3 did unsafely from a
+     *      synchronous registration callback inside onCreate. Once we are well past
+     *      onCreate (we only call this from the periodic refresh handler or a
+     *      deferred listener that has already dropped its first "flash" callback),
+     *      this is the documented way to push our session back to the top of
+     *      MediaSessionManager's most-recently-active list.
+     *   3. Push a fresh PlaybackStateCompat with a current timestamp.
+     */
     private fun refreshSessionState() {
         if (!::mediaSession.isInitialized) return
+        reassertCount++
+        lastReassertWallClock = System.currentTimeMillis()
         runCatching {
-            if (!mediaSession.isActive) mediaSession.isActive = true
+            ensureSilencePlayerRunning()
+
+            // Push to top of active-sessions list. Safe outside onCreate now that all
+            // listeners are deferred and ignore their first registration-time callback.
+            if (mediaSession.isActive) mediaSession.isActive = false
+            mediaSession.isActive = true
+
             val supportedActions = PlaybackStateCompat.ACTION_PLAY or
                 PlaybackStateCompat.ACTION_PAUSE or
                 PlaybackStateCompat.ACTION_PLAY_PAUSE or
@@ -155,8 +198,26 @@ class BlockerService : Service() {
                     .setActions(supportedActions)
                     .build(),
             )
-            silencePlayer?.takeIf { !it.isPlaying }?.start()
         }
+        updateNotificationContent()
+    }
+
+    /**
+     * Ensures the silent loop is actually running. If the existing player is null,
+     * not playing, or in an error state, releases it and creates a fresh one.
+     * v1.9: needed because during a call the audio system can pause / error the
+     * MediaPlayer, after which `start()` no-ops without any error indication.
+     */
+    private fun ensureSilencePlayerRunning() {
+        val player = silencePlayer
+        val running = player?.let { runCatching { it.isPlaying }.getOrDefault(false) } == true
+        if (running) return
+        runCatching {
+            player?.stop()
+            player?.release()
+        }
+        silencePlayer = null
+        startSilentLoop()
     }
 
     // --- mode / telephony listener wiring --------------------------------------------
@@ -197,12 +258,14 @@ class BlockerService : Service() {
         val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
         audioManager = am
         lastSeenAudioMode = am.mode
+        lastSeenModeForUi = am.mode
         val executor: Executor = mainExecutor
         val listener = AudioManager.OnModeChangedListener { mode ->
             handleAudioModeChanged(mode)
         }
         am.addOnModeChangedListener(executor, listener)
         modeChangedListener = listener
+        updateNotificationContent()
     }
 
     @Suppress("DEPRECATION")
@@ -227,14 +290,21 @@ class BlockerService : Service() {
     private fun handleAudioModeChanged(mode: Int) {
         val previous = lastSeenAudioMode
         lastSeenAudioMode = mode
+        lastSeenModeForUi = mode
         if (!sawFirstAudioModeCallback) {
             sawFirstAudioModeCallback = true
             Log.d(TAG, "AudioManager initial mode=$mode, ignoring (registration flash)")
+            updateNotificationContent()
             return
         }
+        modeChangeCount++
+        Log.d(TAG, "Audio mode change: prev=$previous current=$mode")
         if (mode == AudioManager.MODE_NORMAL && previous != AudioManager.MODE_NORMAL) {
-            Log.d(TAG, "Audio mode returned to NORMAL (prev=$previous), reasserting session")
+            Log.d(TAG, "Audio mode returned to NORMAL, reasserting session")
             refreshSessionState()
+        } else {
+            // Surface the increment immediately even if we don't reassert this round.
+            updateNotificationContent()
         }
     }
 
@@ -295,6 +365,19 @@ class BlockerService : Service() {
     }
 
     private fun startInForeground() {
+        val notification = buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun buildNotification(): Notification {
         val openAppIntent = PendingIntent.getActivity(
             this,
             0,
@@ -308,10 +391,9 @@ class BlockerService : Service() {
             Intent(this, BlockerService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-
-        val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
+        return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.notification_title))
-            .setContentText(getString(R.string.notification_text))
+            .setContentText(buildDiagnosticLine())
             .setSmallIcon(R.drawable.ic_block_notification)
             .setContentIntent(openAppIntent)
             .addAction(
@@ -322,16 +404,32 @@ class BlockerService : Service() {
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOnlyAlertOnce(true)
             .build()
+    }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
-            )
+    /**
+     * Compact one-line diagnostic shown in the FGS notification text. Format:
+     *   m=<audioMode> M=<modeChanges> R=<reasserts> B=<buttons> a=<secondsAgo>
+     * where audioMode is the most recently observed AudioManager.MODE_* value,
+     * modeChanges is how many times we've seen it transition, reasserts is how many
+     * times we've forced session priority back, buttons is how many media-button
+     * events our callback actually saw (i.e. successful blocks), and secondsAgo is
+     * how long ago the last reassert happened.
+     */
+    private fun buildDiagnosticLine(): String {
+        val secondsAgo = if (lastReassertWallClock == 0L) {
+            "-"
         } else {
-            startForeground(NOTIFICATION_ID, notification)
+            ((System.currentTimeMillis() - lastReassertWallClock) / 1000L).toString()
+        }
+        return "m=$lastSeenModeForUi M=$modeChangeCount R=$reassertCount B=$buttonCount a=${secondsAgo}s"
+    }
+
+    private fun updateNotificationContent() {
+        runCatching {
+            val nm = getSystemService(NotificationManager::class.java) ?: return
+            nm.notify(NOTIFICATION_ID, buildNotification())
         }
     }
 
@@ -341,7 +439,7 @@ class BlockerService : Service() {
                 MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
                     MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS,
             )
-            setCallback(BlockingCallback)
+            setCallback(BlockingCallback())
 
             val supportedActions = PlaybackStateCompat.ACTION_PLAY or
                 PlaybackStateCompat.ACTION_PAUSE or
@@ -382,11 +480,13 @@ class BlockerService : Service() {
         }
     }
 
-    private object BlockingCallback : MediaSessionCompat.Callback() {
+    private inner class BlockingCallback : MediaSessionCompat.Callback() {
         override fun onMediaButtonEvent(mediaButtonEvent: Intent): Boolean {
             // Swallow the event. Returning true tells the framework not to fall back
             // to the default onPlay/onPause handlers and not to forward it elsewhere.
-            Log.d(TAG, "Blocked media button event: $mediaButtonEvent")
+            buttonCount++
+            Log.d(TAG, "Blocked media button event: $mediaButtonEvent (total=$buttonCount)")
+            updateNotificationContent()
             return true
         }
 
@@ -401,7 +501,7 @@ class BlockerService : Service() {
         private const val TAG = "BlockerService"
         private const val CHANNEL_ID = "blocker_channel"
         private const val NOTIFICATION_ID = 1001
-        private const val REFRESH_INTERVAL_MS = 3_000L
+        private const val REFRESH_INTERVAL_MS = 1_000L
         const val ACTION_STOP = "com.julia.mediabuttonblocker.action.STOP"
 
         fun start(context: Context) {
