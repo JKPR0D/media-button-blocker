@@ -24,6 +24,7 @@ import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.media.session.MediaButtonReceiver
+import java.util.concurrent.Executor
 
 /**
  * Foreground service that intercepts headphone media-button events.
@@ -52,25 +53,41 @@ class BlockerService : Service() {
         }
     }
 
-    // --- Telephony listening ---------------------------------------------------------
+    // --- Audio-mode / call-state listening -------------------------------------------
     //
-    // We watch for phone-call state transitions so we can re-assert our MediaSession
-    // the moment a call ends. This addresses the v1.2-era regression "blocking dies
-    // after I take or end a call": while the phone is ringing or in-call, the in-call
-    // audio stack temporarily steals media-button routing, and Android does not always
-    // hand it back to us once the call returns to IDLE.
+    // We watch for the system audio-mode going back to MODE_NORMAL from anything
+    // "non-normal" (RINGTONE / IN_CALL / IN_COMMUNICATION / CALL_SCREENING) so we can
+    // re-assert our MediaSession the moment a call or messenger voice playback ends.
+    // This addresses the v1.2-era regression "blocking dies after I take a call /
+    // listen to a voice message": while another app holds in-call or in-communication
+    // mode, that audio stack temporarily steals media-button routing, and Android
+    // does not always hand it back to us when the mode returns to NORMAL.
+    //
+    // We prefer AudioManager.OnModeChangedListener (API 31+) because:
+    //   - It does not require READ_PHONE_STATE (telephony listeners on Android 12+
+    //     are filtered to IDLE for callers without that permission, which is exactly
+    //     why v1.7 didn't actually fire on the user's missed call).
+    //   - It also covers messenger voice messages, which set MODE_IN_COMMUNICATION
+    //     but never trigger TelephonyManager call states.
+    //
+    // On API < 31 we fall back to PhoneStateListener (best-effort, may silently no-op
+    // if READ_PHONE_STATE isn't held). The user's primary device runs Android 15.
     //
     // Two safety rules apply, learned the hard way from v1.3 (which broke blocking
     // entirely):
     //   1. We register the listener AFTER initMediaSession() / startSilentLoop()
     //      so the session is already known to MediaSessionManager.
-    //   2. We IGNORE the first callback we receive after registration. Both
-    //      TelephonyCallback and PhoneStateListener fire synchronously with the
-    //      current state at registration time; reacting to that 'flash' would run a
-    //      reassert before our session has fully propagated through the system, which
-    //      is exactly what knocked us off the routing list in v1.3.
+    //   2. We IGNORE the first callback we receive after registration. Both APIs
+    //      fire synchronously with the current state at registration time; reacting
+    //      to that 'flash' would run a reassert before our session has fully
+    //      propagated through the system, which is exactly what knocked us off the
+    //      routing list in v1.3.
+    private var audioManager: AudioManager? = null
+    private var modeChangedListener: AudioManager.OnModeChangedListener? = null
+    private var lastSeenAudioMode: Int = AudioManager.MODE_NORMAL
+    private var sawFirstAudioModeCallback: Boolean = false
+
     private var telephonyManager: TelephonyManager? = null
-    private var modernTelephonyCallback: TelephonyCallback? = null
     private var legacyPhoneStateListener: PhoneStateListener? = null
     private var lastSeenCallState: Int = TelephonyManager.CALL_STATE_IDLE
     private var sawFirstCallStateCallback: Boolean = false
@@ -84,9 +101,9 @@ class BlockerService : Service() {
         startInForeground()
         initMediaSession()
         startSilentLoop()
-        // Telephony listener has to come after the session is fully wired up.
-        // See registerTelephonyCallback() for why we also wait one tick.
-        registerTelephonyCallback()
+        // Mode / telephony listener has to come after the session is fully wired up.
+        // See registerCallStateListeners() for why we also wait one tick.
+        registerCallStateListeners()
         refreshHandler.postDelayed(refreshRunnable, REFRESH_INTERVAL_MS)
     }
 
@@ -105,7 +122,7 @@ class BlockerService : Service() {
     override fun onDestroy() {
         Log.d(TAG, "onDestroy")
         refreshHandler.removeCallbacks(refreshRunnable)
-        unregisterTelephonyCallback()
+        unregisterCallStateListeners()
         runCatching {
             silencePlayer?.stop()
             silencePlayer?.release()
@@ -142,43 +159,56 @@ class BlockerService : Service() {
         }
     }
 
-    // --- telephony listener wiring ----------------------------------------------------
+    // --- mode / telephony listener wiring --------------------------------------------
 
     /**
-     * Subscribes to phone-call state changes so we can reassert our session as soon as
-     * a call ends. We deliberately defer registration by one main-thread tick so the
-     * MediaSession we just created in [initMediaSession] has a chance to finish
-     * propagating through the system; if a synchronous registration callback then
-     * fires (it always does, with the current call state), [onCallStateChanged] will
-     * skip the reassert thanks to [sawFirstCallStateCallback].
+     * Subscribes to whichever call-state-ish signal is available without requiring an
+     * extra runtime permission, so we can reassert our session as soon as a call or
+     * messenger voice playback ends.
+     *
+     * Preference order:
+     *   - API 31+: [AudioManager.OnModeChangedListener]. Fires for ringtone, in-call,
+     *     in-communication, call-screening and back to normal mode. Doesn't need
+     *     READ_PHONE_STATE. Also covers messenger voice messages that switch the
+     *     audio mode.
+     *   - API < 31: legacy [PhoneStateListener]. Best-effort — will silently no-op if
+     *     the system requires READ_PHONE_STATE and we haven't been granted it.
+     *
+     * Registration is deferred by one main-thread tick so the MediaSession we just
+     * created in [initMediaSession] has a chance to finish propagating through the
+     * system; the synchronous registration-time callback that fires immediately after
+     * is then dropped by the [sawFirstAudioModeCallback] / [sawFirstCallStateCallback]
+     * guards.
      */
-    private fun registerTelephonyCallback() {
-        val tm = getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager ?: return
-        telephonyManager = tm
+    private fun registerCallStateListeners() {
         refreshHandler.post {
-            runCatching {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    registerModernTelephonyCallback(tm)
-                } else {
-                    registerLegacyPhoneStateListener(tm)
-                }
-            }.onFailure { Log.w(TAG, "Failed to register telephony listener", it) }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                runCatching { registerAudioModeListener() }
+                    .onFailure { Log.w(TAG, "Failed to register audio-mode listener", it) }
+            } else {
+                runCatching { registerLegacyPhoneStateListener() }
+                    .onFailure { Log.w(TAG, "Failed to register legacy phone-state listener", it) }
+            }
         }
     }
 
     @RequiresApi(Build.VERSION_CODES.S)
-    private fun registerModernTelephonyCallback(tm: TelephonyManager) {
-        val cb = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
-            override fun onCallStateChanged(state: Int) {
-                handleCallStateChanged(state)
-            }
+    private fun registerAudioModeListener() {
+        val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        audioManager = am
+        lastSeenAudioMode = am.mode
+        val executor: Executor = mainExecutor
+        val listener = AudioManager.OnModeChangedListener { mode ->
+            handleAudioModeChanged(mode)
         }
-        tm.registerTelephonyCallback(mainExecutor, cb)
-        modernTelephonyCallback = cb
+        am.addOnModeChangedListener(executor, listener)
+        modeChangedListener = listener
     }
 
     @Suppress("DEPRECATION")
-    private fun registerLegacyPhoneStateListener(tm: TelephonyManager) {
+    private fun registerLegacyPhoneStateListener() {
+        val tm = getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager ?: return
+        telephonyManager = tm
         val listener = object : PhoneStateListener() {
             override fun onCallStateChanged(state: Int, phoneNumber: String?) {
                 handleCallStateChanged(state)
@@ -189,11 +219,29 @@ class BlockerService : Service() {
     }
 
     /**
-     * Handles the actual call-state transition. We only reassert our session when the
-     * call returns to IDLE *from* a non-IDLE state (i.e. a real RINGING -> IDLE or
-     * OFFHOOK -> IDLE transition). The very first callback after registration carries
-     * the current state and is ignored — see [sawFirstCallStateCallback] / the comment
-     * on the field.
+     * Handles an audio-mode change. We reassert when the mode returns to
+     * [AudioManager.MODE_NORMAL] from any non-normal state (ringtone, in-call,
+     * in-communication, call-screening). The first callback after registration
+     * carries the current mode and is ignored — see [sawFirstAudioModeCallback].
+     */
+    private fun handleAudioModeChanged(mode: Int) {
+        val previous = lastSeenAudioMode
+        lastSeenAudioMode = mode
+        if (!sawFirstAudioModeCallback) {
+            sawFirstAudioModeCallback = true
+            Log.d(TAG, "AudioManager initial mode=$mode, ignoring (registration flash)")
+            return
+        }
+        if (mode == AudioManager.MODE_NORMAL && previous != AudioManager.MODE_NORMAL) {
+            Log.d(TAG, "Audio mode returned to NORMAL (prev=$previous), reasserting session")
+            refreshSessionState()
+        }
+    }
+
+    /**
+     * Legacy fallback: handles the actual call-state transition. We only reassert our
+     * session when the call returns to IDLE from a non-IDLE state. The first callback
+     * after registration is ignored.
      */
     private fun handleCallStateChanged(state: Int) {
         val previous = lastSeenCallState
@@ -211,20 +259,20 @@ class BlockerService : Service() {
         }
     }
 
-    private fun unregisterTelephonyCallback() {
-        val tm = telephonyManager ?: return
-        runCatching {
-            modernTelephonyCallback?.let {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    tm.unregisterTelephonyCallback(it)
-                }
-            }
+    private fun unregisterCallStateListeners() {
+        val am = audioManager
+        val listener = modeChangedListener
+        if (am != null && listener != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            runCatching { am.removeOnModeChangedListener(listener) }
         }
+        modeChangedListener = null
+        audioManager = null
+
+        val tm = telephonyManager
         @Suppress("DEPRECATION")
         runCatching {
-            legacyPhoneStateListener?.let { tm.listen(it, PhoneStateListener.LISTEN_NONE) }
+            legacyPhoneStateListener?.let { tm?.listen(it, PhoneStateListener.LISTEN_NONE) }
         }
-        modernTelephonyCallback = null
         legacyPhoneStateListener = null
         telephonyManager = null
     }
