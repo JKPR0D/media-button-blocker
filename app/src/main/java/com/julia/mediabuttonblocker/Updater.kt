@@ -57,6 +57,7 @@ object Updater {
             if (cursor == null || !cursor.moveToFirst()) return null
             val statusIdx = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
             val uriIdx = cursor.getColumnIndex(DownloadManager.COLUMN_LOCAL_URI)
+            if (statusIdx == -1 || uriIdx == -1) return null
             if (cursor.getInt(statusIdx) != DownloadManager.STATUS_SUCCESSFUL) return null
             val localUri = cursor.getString(uriIdx) ?: return null
             val parsed = Uri.parse(localUri)

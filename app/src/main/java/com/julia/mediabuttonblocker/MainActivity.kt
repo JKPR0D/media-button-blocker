@@ -44,13 +44,14 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -112,8 +113,10 @@ private fun BlockerScreen(
     onToggle: (Boolean) -> Unit,
 ) {
     var enabled by remember { mutableStateOf(initialEnabled) }
+    // Re-sync toggle with the persisted pref on every ON_RESUME so that
+    // stopping the service from the notification keeps the UI in sync.
     var updateInfo by remember { mutableStateOf<UpdateInfo?>(null) }
-    var pendingDownloadId by remember { mutableLongStateOf(-1L) }
+    var pendingDownloadId by rememberSaveable { mutableLongStateOf(-1L) }
     val context = LocalContext.current
 
     // Once per Activity creation, hit the GitHub releases API and surface the
@@ -161,6 +164,7 @@ private fun BlockerScreen(
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
+                enabled = BlockerPrefs.isEnabled(context)
                 batteryOptimized = !BatterySaverHelper.isIgnoringBatteryOptimizations(context)
                 powerSaveOn = BatterySaverHelper.isPowerSaveMode(context)
             }

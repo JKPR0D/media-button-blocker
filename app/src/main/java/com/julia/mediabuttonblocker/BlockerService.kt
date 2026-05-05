@@ -206,7 +206,7 @@ class BlockerService : Service() {
                 PlaybackStateCompat.Builder()
                     .setState(
                         PlaybackStateCompat.STATE_PLAYING,
-                        System.currentTimeMillis(),
+                        PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN,
                         1.0f,
                     )
                     .setActions(supportedActions)
@@ -474,7 +474,7 @@ class BlockerService : Service() {
         val state = PlaybackStateCompat.Builder()
             .setState(
                 PlaybackStateCompat.STATE_PLAYING,
-                System.currentTimeMillis(),
+                PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN,
                 1.0f,
             )
             .setActions(supportedActions)
@@ -561,18 +561,28 @@ class BlockerService : Service() {
             .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
             .build()
-        silencePlayer = MediaPlayer().apply {
-            setAudioAttributes(attrs)
-            isLooping = true
-            setVolume(0f, 0f)
-            val afd = resources.openRawResourceFd(R.raw.silence) ?: return@apply
-            afd.use { setDataSource(it.fileDescriptor, it.startOffset, it.length) }
-            setOnErrorListener { _, what, extra ->
+        val player = MediaPlayer()
+        try {
+            player.setAudioAttributes(attrs)
+            player.isLooping = true
+            player.setVolume(0f, 0f)
+            val afd = resources.openRawResourceFd(R.raw.silence)
+            if (afd == null) {
+                player.release()
+                return
+            }
+            afd.use { player.setDataSource(it.fileDescriptor, it.startOffset, it.length) }
+            player.setOnErrorListener { _, what, extra ->
                 Log.w(TAG, "MediaPlayer error: what=$what extra=$extra")
                 true
             }
-            prepare()
-            start()
+            player.prepare()
+            player.start()
+            silencePlayer = player
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to start silent loop", e)
+            runCatching { player.release() }
+            silencePlayer = null
         }
     }
 
@@ -597,10 +607,10 @@ class BlockerService : Service() {
         private const val TAG = "BlockerService"
         private const val CHANNEL_ID = "blocker_channel"
         private const val NOTIFICATION_ID = 1001
-        // v1.12: every tick performs a full soft-restart, so the swap interval
-        // *is* the recovery latency after a call / voice message ends. 1s keeps it
-        // perceptually instant.
-        private const val REFRESH_INTERVAL_MS = 1_000L
+        // Soft-restart interval. 3s balances recovery latency against battery /
+        // GC overhead (~28 800 restarts/day instead of 86 400). On-demand restarts
+        // still fire immediately from the audio-mode listener when a call ends.
+        private const val REFRESH_INTERVAL_MS = 3_000L
         const val ACTION_STOP = "com.julia.mediabuttonblocker.action.STOP"
 
         fun start(context: Context) {
@@ -614,14 +624,6 @@ class BlockerService : Service() {
 
         fun stop(context: Context) {
             context.stopService(Intent(context, BlockerService::class.java))
-        }
-
-        @Suppress("UNUSED_PARAMETER")
-        fun isAudioRouteHeadset(context: Context): Boolean {
-            // Reserved for future use: detect if BT/wired headset is plugged in.
-            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return false
-            @Suppress("DEPRECATION")
-            return am.isWiredHeadsetOn || am.isBluetoothA2dpOn || am.isBluetoothScoOn
         }
     }
 }
