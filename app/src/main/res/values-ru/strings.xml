@@ -30,4 +30,6 @@
     <string name="notification_text">Нажатие play/pause на наушниках перехватывается.</string>
     <string name="notification_stop_action">Стоп</string>
     <string name="notification_diag">режим=%1$d событий=%2$d пинг=%3$d свап=%4$d слушатель=%5$d блок=%6$d</string>
+
+    <string name="permission_denied_message">Уведомления запрещены. Блокировка продолжает работать, но уведомление не появится и остановить из него нельзя — используйте переключатель на этом экране.</string>
 </resources>

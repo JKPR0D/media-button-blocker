@@ -30,4 +30,6 @@
     <string name="notification_text">Headphone play/pause is being intercepted.</string>
     <string name="notification_stop_action">Stop</string>
     <string name="notification_diag">mode=%1$d events=%2$d pings=%3$d swaps=%4$d listener=%5$d blocks=%6$d</string>
+
+    <string name="permission_denied_message">Notifications are denied. Blocking is still on, but you will not see the notification or be able to stop it from there — use the toggle in this screen.</string>
 </resources>

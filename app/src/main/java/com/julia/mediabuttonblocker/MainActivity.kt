@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -61,10 +62,20 @@ import com.julia.mediabuttonblocker.ui.theme.MediaButtonBlockerTheme
 class MainActivity : ComponentActivity() {
 
     private val requestNotificationPermission =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             // Whether or not the user grants POST_NOTIFICATIONS we still start the
             // service — Android just won't show the FGS notification on Android 13+
             // until the permission is granted, but the FGS itself still runs.
+            // We surface a Toast on denial so the user understands the service is
+            // running invisibly: without the FGS notification there is no in-app
+            // way to stop it apart from the master switch in this Activity.
+            if (!granted) {
+                Toast.makeText(
+                    this,
+                    R.string.permission_denied_message,
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
             startBlocker()
         }
 
