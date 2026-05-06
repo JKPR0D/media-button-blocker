@@ -20,10 +20,14 @@
     <string name="power_save_banner_title">Battery Saver is on</string>
     <string name="power_save_banner_text">While the system is in power-save mode the blocker may briefly stop intercepting the media button. Plug in or turn off Battery Saver for reliable blocking.</string>
 
+    <string name="notification_access_banner_title">Allow notification access</string>
+    <string name="notification_access_banner_text">Required to automatically restore blocking after a phone call or a voice message. The app will not read or post any notifications.</string>
+    <string name="notification_access_banner_button">Open settings</string>
+
     <string name="notification_channel_name">Media button blocker</string>
     <string name="notification_channel_desc">Foreground service that intercepts headphone media key</string>
     <string name="notification_title">Media button is blocked</string>
     <string name="notification_text">Headphone play/pause is being intercepted.</string>
     <string name="notification_stop_action">Stop</string>
-    <string name="notification_diag">mode=%1$d events=%2$d pings=%3$d swaps=%4$d blocks=%5$d</string>
+    <string name="notification_diag">mode=%1$d events=%2$d pings=%3$d swaps=%4$d listener=%5$d blocks=%6$d</string>
 </resources>

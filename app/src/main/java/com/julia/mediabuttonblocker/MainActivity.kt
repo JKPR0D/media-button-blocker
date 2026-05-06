@@ -26,6 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BatteryAlert
 import androidx.compose.material.icons.filled.BatterySaver
 import androidx.compose.material.icons.filled.Block
+import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -157,12 +158,19 @@ private fun BlockerScreen(
         mutableStateOf(!BatterySaverHelper.isIgnoringBatteryOptimizations(context))
     }
     var powerSaveOn by remember { mutableStateOf(BatterySaverHelper.isPowerSaveMode(context)) }
+    // v1.13: Notification access is granted from the system Settings screen,
+    // outside our process. We re-check on ON_RESUME so the banner disappears as
+    // soon as the user comes back from toggling our entry on.
+    var notificationAccessGranted by remember {
+        mutableStateOf(NotificationAccessHelper.isGranted(context))
+    }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 batteryOptimized = !BatterySaverHelper.isIgnoringBatteryOptimizations(context)
                 powerSaveOn = BatterySaverHelper.isPowerSaveMode(context)
+                notificationAccessGranted = NotificationAccessHelper.isGranted(context)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -225,6 +233,13 @@ private fun BlockerScreen(
             if (powerSaveOn) {
                 PowerSaveBanner()
             }
+            if (!notificationAccessGranted) {
+                NotificationAccessBanner(
+                    onOpenSettingsClick = {
+                        NotificationAccessHelper.openSettings(context)
+                    },
+                )
+            }
             ToggleCard(enabled = enabled, onCheckedChange = {
                 enabled = it
                 onToggle(it)
@@ -277,6 +292,54 @@ private fun BatteryOptimizationBanner(onAllowClick: () -> Unit) {
             Spacer(Modifier.padding(horizontal = 4.dp))
             Button(onClick = onAllowClick) {
                 Text(context.getString(R.string.battery_optimization_banner_button))
+            }
+        }
+    }
+}
+
+@Composable
+private fun NotificationAccessBanner(onOpenSettingsClick: () -> Unit) {
+    val context = LocalContext.current
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+        ),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f, fill = true),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.NotificationsActive,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onTertiaryContainer,
+                )
+                Spacer(Modifier.padding(horizontal = 8.dp))
+                Column {
+                    Text(
+                        text = context.getString(R.string.notification_access_banner_title),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    )
+                    Text(
+                        text = context.getString(R.string.notification_access_banner_text),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    )
+                }
+            }
+            Spacer(Modifier.padding(horizontal = 4.dp))
+            Button(onClick = onOpenSettingsClick) {
+                Text(context.getString(R.string.notification_access_banner_button))
             }
         }
     }
