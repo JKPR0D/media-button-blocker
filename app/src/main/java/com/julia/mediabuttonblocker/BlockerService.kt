@@ -87,6 +87,12 @@ class BlockerService : Service() {
     private var lastSeenModeForUi: Int = AudioManager.MODE_NORMAL
     private var lastReassertWallClock: Long = 0L
 
+    // Tracks whether the silent MediaPlayer has finished its async prepare() call.
+    // We start prepareAsync() in startSilentLoop() and only flip this true from the
+    // OnPreparedListener; ensureSilencePlayerRunning() consults this to avoid
+    // tearing down a player that's still legitimately preparing.
+    private var silencePlayerReady: Boolean = false
+
     // --- Audio-mode / call-state listening -------------------------------------------
     //
     // We watch for the system audio-mode going back to MODE_NORMAL from anything
@@ -188,8 +194,13 @@ class BlockerService : Service() {
             return START_NOT_STICKY
         }
         // Forward any media-button intents the system delivers to the receiver into our
-        // session so the callback fires.
-        MediaButtonReceiver.handleIntent(mediaSession, intent)
+        // session so the callback fires. Guarded against the rare case where the
+        // system redelivers an intent (START_STICKY) before onCreate() has finished
+        // initialising the lateinit field — without the check that would throw
+        // UninitializedPropertyAccessException and crash the process.
+        if (::mediaSession.isInitialized) {
+            MediaButtonReceiver.handleIntent(mediaSession, intent)
+        }
         return START_STICKY
     }
 
@@ -202,9 +213,12 @@ class BlockerService : Service() {
             silencePlayer?.release()
         }
         silencePlayer = null
+        silencePlayerReady = false
         runCatching {
-            mediaSession.isActive = false
-            mediaSession.release()
+            if (::mediaSession.isInitialized) {
+                mediaSession.isActive = false
+                mediaSession.release()
+            }
         }
         super.onDestroy()
     }
@@ -274,11 +288,16 @@ class BlockerService : Service() {
         val player = silencePlayer
         val running = player?.let { runCatching { it.isPlaying }.getOrDefault(false) } == true
         if (running) return
+        // Don't tear down a player that's still in the middle of an async prepare —
+        // wait for OnPreparedListener to flip silencePlayerReady. Otherwise we'd
+        // release it from under the system and end up in a release/recreate loop.
+        if (player != null && !silencePlayerReady) return
         runCatching {
             player?.stop()
             player?.release()
         }
         silencePlayer = null
+        silencePlayerReady = false
         startSilentLoop()
     }
 
@@ -679,6 +698,7 @@ class BlockerService : Service() {
             silencePlayer?.release()
         }
         silencePlayer = null
+        silencePlayerReady = false
         runCatching { startSilentLoop() }
             .onFailure { Log.w(TAG, "Failed to restart silent loop", it) }
 
@@ -720,8 +740,17 @@ class BlockerService : Service() {
                 Log.w(TAG, "MediaPlayer error: what=$what extra=$extra")
                 true
             }
-            prepare()
-            start()
+            // Use prepareAsync() to keep this off the main thread. Synchronous
+            // prepare() runs file I/O on the calling thread, which is the main
+            // thread because performSoftRestart() is dispatched on
+            // refreshHandler (Looper.getMainLooper()). On a slow device that
+            // 1 Hz prepare() is enough to trip ANR.
+            setOnPreparedListener { player ->
+                silencePlayerReady = true
+                runCatching { player.start() }
+                    .onFailure { Log.w(TAG, "Failed to start silent player after prepare", it) }
+            }
+            prepareAsync()
         }
     }
 
